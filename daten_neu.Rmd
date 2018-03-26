@@ -1,0 +1,230 @@
+---
+title: "Wohungsmarkt"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r read_data perform joins, include=TRUE}
+
+persons = read_excel("input/persons.xlsx") %>% 
+    # modifying value "extreme", since aggregation of both extremes doesn't make sense
+    mutate(typ = ifelse(name == "Carsten Meier", "extreme positive", typ)) %>%
+    mutate(typ = ifelse(name == "Lovis Kuhn", "extreme negative", typ)) %>%
+    rename(kuerzel = reihenfolge)
+
+confirmations = read_csv("input/confirmations.csv", 
+                         col_types = cols(
+                             date = col_datetime(format = "%Y-%m-%dT%H:%M:%S%Z"),
+                             delta = col_double(),
+                             delta_bin = col_number())) %>%
+    rename(link = flat_link) %>%
+    mutate(run = ifelse(date < as.Date("2016-08-31"), 1, 2)) %>%
+    mutate(duplicate = (duplicate == "true")) %>%
+    mutate(first = (first == "true"))
+
+flats = read_csv("input/flats.csv", 
+                 col_types = cols(
+                     request_date = col_date(format = "%Y-%m-%d"),
+                     request_datetime = col_datetime(format = "%Y-%m-%dT%H:%M:%S%Z"),
+                     flat_meta.price = col_double(),
+                     flat_meta.surface = col_double())) %>%
+    # add column run analogue to mails
+    mutate(run = ifelse(request_date < as.Date("2016-08-31"), 1, 2)) %>%
+    mutate(geography = ifelse(city %in% c("berlin", "dresden", "leipzig", "magdeburg"), "ost", "west")) %>%
+    # calculate a 'normalized' order concerning only non-duplicate requests from normal profiles
+    mutate(
+        order_normal = gsub("[xy]", "", order),
+        # convert first occurence of a person from each nationality
+        order_normal = sub("a", "A", order_normal),
+        order_normal = sub("i", "I", order_normal),
+        order_normal = sub("p", "P", order_normal),
+        order_normal = sub("t", "T", order_normal),
+        order_normal = sub("g", "G", order_normal),
+        # remove duplicate occurences
+        order_normal = gsub("[aiptg]", "", order_normal),
+        order_normal = tolower(order_normal)
+    )
+
+# select immowelt-version of flats inserated on both websites (with same title)
+flats_duplicates_immowelt = flats %>%
+    group_by(city, flat_meta.price, flat_meta.surface, request_date, flat_meta.title) %>%
+    summarise(n = n(), website_distinct = n_distinct(website), link = max(link), run = max(run)) %>%
+    select(-flat_meta.title) %>%
+    filter(n == 2) %>%
+    arrange(website_distinct) %>%
+    filter(website_distinct == 2)
+
+# select immowelt-version of flats inserated on both websites (without same title)
+flats_duplicates_immowelt_excl = flats %>%
+    group_by(city, flat_meta.price, flat_meta.surface, request_date) %>%
+    summarise(n = n(), website_distinct = n_distinct(website), link = max(link), run = max(run)) %>%
+    filter(n == 2) %>%
+    arrange(website_distinct) %>%
+    filter(website_distinct == 2)
+
+flats = flats %>%
+    anti_join(flats_duplicates_immowelt, by = c("link", "run")) %>%
+    anti_join(flats_duplicates_immowelt_excl, by = c("link", "run"))
+
+# e.g. flats whose owners uncovered our experiment
+flatsTrash = read_csv("input/_flats_trash.csv", 
+                      col_types = cols(
+                          request_date = col_date(format = "%Y-%m-%d"),
+                          request_datetime = col_datetime(format = "%Y-%m-%dT%H:%M:%S%Z"),
+                          flat_meta.price = col_double(),
+                          flat_meta.surface = col_double())) %>%
+    # add column run analogue to mails
+    mutate(run = ifelse(request_date < as.Date("2016-08-31"), 1, 2))
+
+mails = read_excel("input/mails.xlsx",
+                   col_types = c("text", "text", "text", "text",
+                                 "numeric", "numeric", "numeric", "text")) %>%
+    # consistent NA-values
+    mutate_each(funs(replace(., . == "NA", NA))) %>%
+    mutate_each(funs(replace(., . == ",", NA))) %>%
+    mutate(zeit = parse_datetime(zeit)) %>%
+    # Absender nicht 100% konsistent. Manueller fix:
+    mutate(person = ifelse(person == "drcarstenmeier@gmail.com", "carsten.j.meier@gmail.com", person)) %>%
+    mutate(person = ifelse(person == "dan.bschle.im@gmail.com", "danielbuschle2@gmail.com", person)) %>%
+    mutate(person = ifelse(person == "maryam.abedini.im@gmail.com", "ma03592@gmail.com", person)) %>%
+    mutate(person = ifelse(person == "milena.adamowicz.im@gmail.com", "madameowicz@gmail.com", person)) %>%
+    # Entferne Mails an Gulsen Demirci (TODO: in Excel)
+    filter(!person == "gulsen.demirci.im@gmail.com") %>%
+    filter(!is.na(person)) %>%
+    # Remove because of inconsistent categorizing (TODO: in Excel)
+    filter(!(id %in% c("ObjectId(578793e9a013d54b71559407)", "ObjectId(5788e55ba013d54b7155944a)", "ObjectId(578793e4a013d54b71559401)"))) %>%
+    # Remove mail-duplicates (no usage of unique() because of property id)
+    distinct(zeit, person, flat_id, .keep_all = TRUE) %>%
+    # setNames(gsub("ErsterWertvon", "", names(.))) %>%
+    rename(run = scraping_run) %>%
+    rename(link = flat_link) %>%
+    mutate(link = ifelse(is.na(link), "unknown", link)) 
+
+update_links = function(path) {
+    # update mails_meta with corrected links from new CSV-file 
+    
+    mails_updated = read_csv(path, trim_ws = TRUE)
+    mails %>%
+        left_join(mails_updated, by = c("id")) %>%
+        mutate(link = ifelse(is.na(link.y), link.x, link.y)) %>%
+        select(-link.x, -link.y)
+}
+
+mails = update_links("input/_add_links_short.csv")
+mails = update_links("input/_add_links_5_7_short.csv")
+mails = update_links("input/_fix_links_short.csv")
+mails = update_links("input/_fix_links_round2_short.csv")
+
+# TODO: no (--> cat6) in Excel
+mails = mails %>% 
+    filter(link != "no" & link != "pre" & link != "quoka" & link != "stage0")
+
+# remove mails that relate to black-listed flats
+mails = mails %>%
+    anti_join(flatsTrash, by = c("link", "run")) 
+
+
+################################## JOIN METADATA TO UNITS ##################################
+
+mails_meta = mails %>%
+    left_join(persons, by = c("person" = "mail_1")) %>%
+    select(id, zeit, category, link, person,
+           run, herkunft, typ, migrationshintergrund, geschlecht, name, kuerzel)
+
+# dynamically join flat metadata to mails 
+mails_meta = mails_meta %>%
+    left_join(flats, by = c("link", "run")) %>%
+    rename(flat_metaprice = flat_meta.price) %>%
+    rename(scrape_date = request_date)
+
+find_positions = function(patterns, texts) {
+    # returns vector with position of i-th element in patterns in i-th element of texts
+    
+    apply(cbind(patterns, texts), 1, function(v) { regexpr(v[1], v[2]) })
+}
+
+confirmations_meta = confirmations %>%
+    left_join(persons, by = c("person" = "mail_1")) %>%
+    inner_join(flats %>% select(link, run, order_normal), by = c("link", "run")) %>%
+    mutate(position_normal = find_positions(kuerzel, order_normal))
+
+flats_meta = flats %>%
+    left_join(confirmations_meta %>% select(link, run, geschlecht) %>% unique(), by = c("link", "run"))
+```
+
+
+Im Kern besteht der Datensatz aus vier Tabellen:  
+
+```{r write-processed-data, include=TRUE}
+
+dir.create("data")
+
+write_csv(flats %>% select(`_id`, link, website, request_time, request_date, request_datetime, flat_meta.price, flat_meta.surface, city, order, orga, run), "data/flats.csv")
+write_csv(persons, "data/persons.csv")
+write_csv(mails %>% select(-flat_id), "data/mails.csv")
+write_csv(confirmations, "data/confirmations.csv")
+```
+
+- **persons.xlsx** - Die 14 fiktiven Personen, die für die Kontaktaufname genutzt wurden sowie deren Name, Geschlecht, Herkunft und Mail-Adresse.
+- **confirmations.csv** - Übersicht über alle im Lauf des Versuchs erfolgreich angefragten Wohnungsannoncen. Beinhaltet u.A. die anfragende Person, den Link zur Annonce sowie den zeitlichen Abstand zwischen den Anfragen mit den verschiedenen Profilen.
+- **flats.csv** - Beinhaltet neben dem Link und dem Zeitstempel Meta-Daten zu den angefragten Wohnungen. Aus Datenschutzgründen werden Informationen, die Rückschlüsse auf einzelne Wohnungen oder Inserenten zulassen (Ansprechpartner, Adresse, Betreff, Telefonnumer) nicht veröffentlicht.
+- **mails.xlsx** - Die Kategorisierung der empfangenen Emails. Es wurde folgendes Codebuch verwendet:
+
+| Kategorie | Umschreibung |
+|:-----:|:-----|
+| 1 | positv: Zusage eines Besichtigungstermins |
+| 2 | positive Tendenz: Ein Besichtigungstermin wird in Aussicht gestellt|
+| 3 | Kenntnise: Anfrage wurde zur Kenntnis genommen. Enthält keine Wertung |
+| 4 | negativ: Absage |
+| 5 | Wohung nicht verwertbar: z.B. Seniorenwohnanlage, WG-Zimmer |
+| 6 | Mail nicht verwertbar: keine relevante Aussage (z.B. Newsletter) |
+| 7 | Makler-Masche: Versuchtes Umgehen des Besteller-Prinzips |
+| 8 | Spam/Scam: Ohne Aussage hinsichtlich der Diskriminierung |
+
+
+<!-- part of data preparation for global analysis only -->
+```{r filter-units-meta, include=TRUE}
+
+# black-list of mails because of category
+mails_cat578 = mails_meta %>%
+    filter(category == 5 | category == 7 | category == 8)
+
+mails_meta = mails_meta %>%
+    # filter mails relating to flats that were assigned 5, 7 or 8
+    anti_join(mails_cat578 %>% filter(link != "unknown"), by = c("link", "run"))
+
+mails_linked = mails_meta %>% 
+    filter(link != "unknown")
+
+flats_meta = flats_meta %>%
+    anti_join(mails_cat578, by = c("link", "run"))
+
+confirmations_meta = confirmations_meta %>%
+    anti_join(mails_cat578, by = c("link", "run"))
+
+confirmations_meta_unique = confirmations_meta %>% 
+    filter(duplicate != TRUE) %>%
+    inner_join(flats %>% select(link, run, orga, city, order), by = c("link", "run"))
+```
+
+```{r}
+new <- mails_linked %>% 
+    semi_join(flats_meta, by = c("link", "run")) %>%
+    rename(
+        preis = flat_metaprice, 
+        flaeche = flat_meta.surface, 
+        zimmer = flat_meta.rooms,
+        stadt = city
+    ) %>%
+    select(herkunft, geschlecht, name, preis, zimmer, flaeche, stadt, category) %>% 
+    mutate(zimmer = zimmer / 100, einladung = category < 3) %>%
+    select(-category) %>%
+    filter(zimmer < 5, flaeche < 75, flaeche > 25)
+write_csv(new, "data/wohnungen_aufbereitet.csv")
+```
+
+
